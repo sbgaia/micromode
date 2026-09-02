@@ -1,0 +1,11 @@
+**/build/
+**/bin/
+**/*.log
+.vscode/
+cmake-build-debug
+cmake-build-release
+.idea
+*.o
+*.bc
+*.elf
+compile_commands.json
