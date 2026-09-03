@@ -1,5 +1,8 @@
 #include "micromode.h"
+#include "reactor-uc/environment.h"
 #include "unity.h"
+
+Environment* _lf_environment = NULL;
 
 void setUp(void) {}
 void tearDown(void) {}
