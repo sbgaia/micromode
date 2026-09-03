@@ -1,7 +1,9 @@
 **/build/
 **/bin/
 **/*.log
-.vscode/
+.vscode/*
+!.vscode/c_cpp_properties.json
+!.vscode/settings.json
 cmake-build-debug
 cmake-build-release
 .idea

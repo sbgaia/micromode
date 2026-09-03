@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.10)
 project(micromode LANGUAGES C)
 
+# Emit compile_commands.json so editors and clang-tidy see the real flags.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Command line options for the build.
 set(MICROMODE_BUILD_TESTS OFF CACHE BOOL "Build the micromode unit tests")
 set(ASAN OFF CACHE BOOL "Compile with AddressSanitizer")
@@ -38,8 +41,14 @@ add_library(micromode STATIC src/core.c src/commit.c src/triggers.c)
 add_library(micromode::micromode ALIAS micromode)
 target_include_directories(micromode PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include)
 
-# Link to the REACTOR_UC runtime.
-target_link_libraries(micromode PUBLIC reactor-uc::runtime)
+# Link to the REACTOR_UC runtime. Prefer the namespaced name if reactor-uc exports one, but
+# do not invent it here: an ALIAS created in this project does not carry reactor-uc's usage
+# requirements through, so micromode would compile without reactor-uc's include directories.
+if(TARGET reactor-uc::runtime)
+  target_link_libraries(micromode PUBLIC reactor-uc::runtime)
+else()
+  target_link_libraries(micromode PUBLIC reactor-uc)
+endif()
 
 # Compile options and definitions.
 target_compile_definitions(micromode PUBLIC LF_MODAL_MODELS)
