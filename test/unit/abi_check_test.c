@@ -1,4 +1,4 @@
-#include "micromode.h"
+#include "micromode/micromode.h"
 #include "reactor-uc/environment.h"
 #include "unity.h"
 

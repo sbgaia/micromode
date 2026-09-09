@@ -1,4 +1,5 @@
 #include "triggers.h"
+#include "core.h"
 
 #include "reactor-uc/environment.h"
 #include "reactor-uc/logging.h"
@@ -8,11 +9,11 @@
  *
  * Two passes, with different keys and different domains.
  *
- *   SUSPEND runs over every mode, keyed on the effectively_active true -> false edge.
- *   That edge is the only record that a mode deactivated transitively was left 
+ *   suspend runs over every mode, keyed on the effectively_active true -> false edge.
+ *   That edge is the only record that a mode deactivated transitively was left
  *   at all. Recompute_gates writes nothing else.
  *
- *   ENTER runs over modes with entered_this_commit && effectively_active, keyed on
+ *   enter runs over modes with entered_this_commit && effectively_active, keyed on
  *   entry_kind, over that mode's own triggers only. Ownership, not the activation edge: a
  *   history entry of an enclosing mode must not resume a contained modal reactor's
  *   mode-local timers, which become active again without a transition of their own. A
@@ -20,9 +21,14 @@
  *
  *     entry_kind        timers                            actions
  *     ----------------  --------------------------------  ----------------------------
- *     LF_MODE_RESET     purge, then arm at `offset`       purge, incl. slot->saved
- *     LF_MODE_HISTORY   resume at the recorded remaining  restore slot->saved, shifted
- *                       (never armed: its own offset)     by now - slot->suspended_at
+ *     LF_MODE_RESET     purge, then arm at `offset`       purge, incl. the saved pool
+ *     LF_MODE_HISTORY   resume at the recorded remaining  restore the saved pool, shifted
+ *                       (never armed: its own offset)     by now - suspended_at
+ *
+ * Both passes read the mode's kind ONCE, through micromode_hslots, outside the 
+ * per-trigger loop: one branch per mode per commit. A plain mode has no history 
+ * slots, so leaving it drops what it was holding instead of banking it, and 
+ * re-entering it (always a reset since a history transition into a plain mode is refused) has no saved pool to discard.
  */
 
 /** The logical instant of the commit. */
@@ -32,21 +38,12 @@ static instant_t micromode_commit_time(const lf_mode_state_t* state) {
 }
 
 /**
- * @brief Refresh `was_effectively_active` on the slots of every mode whose gate moved this
- * commit, then empty the list. The pre-change value has to be stored rather than derived:
- * once the recompute has run, the old one is gone.
+ * @brief Refresh `was_effectively_active` on one mode's slots. The pre-change value has to be
+ * stored rather than derived: once the recompute has run, the old one is gone.
  */
-void micromode_settle_gate_changes(lf_micromode_program_t* program) {
-  lf_mode_t* mode = program->gate_changed_head;
-  program->gate_changed_head = NULL;
-  while (mode != NULL) {
-    lf_mode_t* next = mode->gate_changed_next;
-    for (size_t trig_idx = 0; trig_idx < mode->ntriggers; trig_idx++) {
-      mode->slots[trig_idx].was_effectively_active = mode->effectively_active;
-    }
-    mode->in_gate_changed_list = false;
-    mode->gate_changed_next = NULL;
-    mode = next;
+static void micromode_settle_one(lf_mode_t* mode) {
+  for (size_t trig_idx = 0; trig_idx < mode->ntriggers; trig_idx++) {
+    mode->slots[trig_idx].was_effectively_active = mode->effectively_active;
   }
 }
 
@@ -67,26 +64,32 @@ void micromode_snapshot_gates(lf_micromode_program_t* program) {
 
 /** Take every trigger of every just-left mode out of the event queue.
  *
- *  Walks the gate-change list rather than every mode in the program. Equivalent, given the
- *  invariant the settle pass maintains: outside this pass a slot's
- *  `was_effectively_active` equals its mode's `effectively_active`, so the key below can only match a mode whose gate this
- *  commit's recompute actually moved, and those are exactly the modes on the list. */
+ *  Walks the gate-change list rather than every mode in the program. Equivalent, 
+ *  given the invariant the settle pass maintains: outside this pass a slot's
+ *  `was_effectively_active` equals its mode's `effectively_active`, so the key below 
+ *  can only match a mode whose gate this commit's recompute actually moved, and 
+ *  those are exactly the modes on the list. */
 static void micromode_suspend_left_modes(lf_micromode_program_t* program) {
-  for (lf_mode_t* mode = program->gate_changed_head; mode != NULL; mode = mode->gate_changed_next) {
+  lf_mode_t* mode = program->gate_changed_head;
+  program->gate_changed_head = NULL;
+  while (mode != NULL) {
+    lf_mode_t* const next = mode->gate_changed_next;
+    mode->in_gate_changed_list = false;
+    mode->gate_changed_next = NULL;
     {
       lf_mode_state_t* state_iter = mode->owner;
-      if (mode->effectively_active) {
-        continue;
-      }
-      if (mode->ntriggers == 0) {
+      if (mode->effectively_active || mode->ntriggers == 0) {
+        micromode_settle_one(mode);
+        mode = next;
         continue;
       }
       instant_t now = micromode_commit_time(state_iter);
+      lf_history_slot_t* hslots = micromode_hslots(mode);
       for (size_t trig_idx = 0; trig_idx < mode->ntriggers; trig_idx++) {
         lf_trigger_slot_t* slot = &mode->slots[trig_idx];
         if (!slot->was_effectively_active) {
           // Already suspended on some earlier tag, or never active at all.
-          continue; 
+          continue;
         }
         if (slot->suspended) {
           // Already suspended on an earlier tag: preserve that state, do not re-take.
@@ -94,37 +97,49 @@ static void micromode_suspend_left_modes(lf_micromode_program_t* program) {
         }
         Trigger* trig = mode->triggers[trig_idx];
         if (trig->type == TRIG_TIMER) {
-          // Timer_suspend takes AND discards in one call. 
+          // Timer_suspend takes AND discards in one call.
           interval_t remaining = NEVER;
           lf_ret_t ret = Timer_suspend((Timer*)trig, &remaining);
           validate(ret == LF_OK || ret == LF_EVENT_NOT_FOUND);
-          slot->remaining = remaining;
-        } else {
+          if (hslots != NULL) {
+            hslots[trig_idx].remaining = remaining; // only a history entry ever resumes it
+          }
+        } else if (hslots != NULL) {
           // A slot too small for the mode's pending events is a wiring bug, hence a
-          // validate rather than an assert. lf_micromode_validate_all already refuses an
-          // action slot with no storage at all, which is the common case.
-          lf_ret_t ret = Trigger_take_pending(trig, slot->saved, slot->saved_cap, &slot->nsaved);
+          // validate rather than an assert. lf_micromode_validate_all already refuses a
+          // history mode's action slot with no storage at all, which is the common case.
+          lf_ret_t ret =
+              Trigger_take_pending(trig, hslots[trig_idx].saved, micromode_saved_bound(trig), &hslots[trig_idx].nsaved);
           validate(ret == LF_OK);
+        } else {
+          // No history transition can reach this mode, so nothing will ever read a saved
+          // event. Drop them instead of banking them: no buffer, no copy.
+          size_t purged = 0;
+          validate(Trigger_purge_pending(trig, &purged) == LF_OK);
         }
-        slot->suspended_at = now;
+        if (hslots != NULL) {
+          hslots[trig_idx].suspended_at = now;
+        }
         slot->suspended = true;
       }
+      micromode_settle_one(mode);
     }
+    mode = next;
   }
 }
 
 /**
  * @brief A reset-kind entry: purge, then arm.
  *
- * The purge matters for a SELF-reset, which targets an already-active mode. The suspend
- * pass never ran for it, so its events are still queued.
+ * The purge matters for a self-reset, which targets an already-active mode. The 
+ * suspend pass never ran for it, so its events are still queued.
  */
-static void micromode_reset_entry(Trigger* trig, lf_trigger_slot_t* slot) {
-  // Order matters: a slot can hold BOTH events saved by an earlier suspension and events
+static void micromode_reset_entry(Trigger* trig, lf_trigger_slot_t* slot, lf_history_slot_t* hslot) {
+  // Order matters: a mode can hold both events saved by an earlier suspension and events
   // still sitting in the event queue. Discard the saved pool first.
-  if (slot->nsaved > 0) {
-    (void)Trigger_discard_pending(trig, slot->saved, slot->nsaved);
-    slot->nsaved = 0;
+  if (hslot != NULL && hslot->nsaved > 0) {
+    (void)Trigger_discard_pending(trig, hslot->saved, hslot->nsaved);
+    hslot->nsaved = 0;
   }
   if (trig->type == TRIG_TIMER) {
     Timer* timer = (Timer*)trig;
@@ -133,28 +148,27 @@ static void micromode_reset_entry(Trigger* trig, lf_trigger_slot_t* slot) {
     validate(ret == LF_OK || ret == LF_EVENT_NOT_FOUND);
     Timer_arm(timer, timer->offset);
   } else {
-    size_t taken = 0;
-    lf_ret_t ret = Trigger_take_pending(trig, slot->saved, slot->saved_cap, &taken);
-    validate(ret == LF_OK);
-    (void)Trigger_discard_pending(trig, slot->saved, taken);
+    // Drop whatever is still queued.
+    size_t purged = 0;
+    validate(Trigger_purge_pending(trig, &purged) == LF_OK);
   }
   slot->suspended = false;
 }
 
-/** A history-kind entry: put back what was taken, at the delay it had left. */
-static void micromode_history_entry(Trigger* trig, lf_trigger_slot_t* slot, instant_t now) {
+// A history-kind entry: put back what was taken, at the delay it had left.
+static void micromode_history_entry(Trigger* trig, lf_trigger_slot_t* slot, lf_history_slot_t* hslot, instant_t now) {
   if (!slot->suspended) {
     return;
   }
   if (trig->type == TRIG_TIMER) {
     // For a mode that has never been effectively active we arm the timer at its own offset.
-    if (slot->remaining != NEVER) {
-      Timer_arm((Timer*)trig, slot->remaining);
+    if (hslot->remaining != NEVER) {
+      Timer_arm((Timer*)trig, hslot->remaining);
     }
-  } else if (slot->nsaved > 0) {
-    // due + (now - suspended_at) == now + remaining, i.e. LF history semantics. 
-    (void)Trigger_restore_pending(trig, slot->saved, slot->nsaved, now - slot->suspended_at);
-    slot->nsaved = 0;
+  } else if (hslot->nsaved > 0) {
+    // due + (now - suspended_at) == now + remaining, i.e. LF history semantics.
+    (void)Trigger_restore_pending(trig, hslot->saved, hslot->nsaved, now - hslot->suspended_at);
+    hslot->nsaved = 0;
   }
   slot->suspended = false;
 }
@@ -163,11 +177,9 @@ static void micromode_history_entry(Trigger* trig, lf_trigger_slot_t* slot, inst
  *
  *  Walks the firing-gate dirty list rather than every mode in the program. Equivalent
  *  here: the only condition this pass acts on is `entered_this_commit`, which is set
- *  exclusively by micromode_apply and cleared again every tag, so it is never 
- *  sticky, and a mode absent from the list provably has it false. 
- *  (The reset-var pass deliberately does NOT do this: it keys on `needs_reset`,
- *  which IS sticky across tags for a mode entered while its parent was inactive, 
- *  so a list built from this tag's entries would miss it.) */
+ *  exclusively by micromode_apply and cleared again every tag, so it is never
+ *  sticky, and a mode absent from the list has it false.
+ */
 static void micromode_resume_entered_modes(lf_micromode_program_t* program) {
   for (lf_mode_t* mode = program->dirty_head; mode != NULL; mode = mode->dirty_next) {
     {
@@ -179,13 +191,19 @@ static void micromode_resume_entered_modes(lf_micromode_program_t* program) {
         continue;
       }
       instant_t now = micromode_commit_time(state_iter);
-      for (size_t trig_idx = 0; trig_idx < mode->ntriggers; trig_idx++) {
-        Trigger* trig = mode->triggers[trig_idx];
-        lf_trigger_slot_t* slot = &mode->slots[trig_idx];
-        if (mode->entry_kind == LF_MODE_RESET) {
-          micromode_reset_entry(trig, slot);
-        } else {
-          micromode_history_entry(trig, slot, now);
+      lf_history_slot_t* hslots = micromode_hslots(mode);
+      if (mode->entry_kind == LF_MODE_RESET) {
+        for (size_t trig_idx = 0; trig_idx < mode->ntriggers; trig_idx++) {
+          micromode_reset_entry(mode->triggers[trig_idx], &mode->slots[trig_idx],
+                                hslots == NULL ? NULL : &hslots[trig_idx]);
+        }
+      } else {
+        // A history entry with no storage to read would silently restore nothing.
+        // lf_micromode_set_mode refuses that transition, and validation refuses a
+        // history-kind mode that owns triggers but no `hslots`.
+        validate(hslots != NULL);
+        for (size_t trig_idx = 0; trig_idx < mode->ntriggers; trig_idx++) {
+          micromode_history_entry(mode->triggers[trig_idx], &mode->slots[trig_idx], &hslots[trig_idx], now);
         }
       }
     }
@@ -225,13 +243,21 @@ void lf_micromode_on_shutdown(void* state, Environment* environment) {
     lf_mode_state_t* state_iter = program->states[state_idx];
     for (size_t mode_idx = 0; mode_idx < state_iter->nmodes; mode_idx++) {
       lf_mode_t* mode = state_iter->modes[mode_idx];
-      for (size_t trigger_idx = 0; trigger_idx < mode->ntriggers; trigger_idx++) {
-        lf_trigger_slot_t* slot = &mode->slots[trigger_idx];
-        if (slot->nsaved > 0) {
-          validate(Trigger_discard_pending(mode->triggers[trigger_idx], slot->saved, slot->nsaved) == LF_OK);
-          slot->nsaved = 0;
+      lf_history_slot_t* hslots = micromode_hslots(mode);
+      if (hslots == NULL) {
+        // Nothing to do: micromode_suspend_left_modes purged this mode's events.
+        for (size_t trigger_idx = 0; trigger_idx < mode->ntriggers; trigger_idx++) {
+          mode->slots[trigger_idx].suspended = false;
         }
-        slot->suspended = false;
+        continue;
+      }
+      for (size_t trigger_idx = 0; trigger_idx < mode->ntriggers; trigger_idx++) {
+        if (hslots[trigger_idx].nsaved > 0) {
+          validate(Trigger_discard_pending(mode->triggers[trigger_idx], hslots[trigger_idx].saved,
+                                           hslots[trigger_idx].nsaved) == LF_OK);
+          hslots[trigger_idx].nsaved = 0;
+        }
+        mode->slots[trigger_idx].suspended = false;
       }
     }
   }
