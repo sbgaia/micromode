@@ -36,9 +36,3 @@ refused, since restoring one of its events after a history entry has no defined
 meaning.
 - a schedule onto a **mode-local action of an inactive mode** is dropped 
 outright, where reactor-c admits the event, warns, and then never delivers it.
-
-Entry-activation *delivery* order for a nested reset cascade is an artefact of 
-reactor-uc's event queue, not of micromode's walk, and differs from reactor-c's 
-from depth 2 up. 
-
-Reactor-c: 1, 2 1, 3 2 1, 4 3 2 1, while reactor-uc: 1, 1 2, 1 3 2, 1 4 3 2. 
