@@ -27,12 +27,3 @@ cannot compile without it.
 ## Behaviour notes
 
 Behaviour was settled by measuring reactor-c on probe programs.
-Three constructs diverge from reactor-c deliberately, each with a refusal or 
-a comment explaining why:
-
-- A **physical action** inside a mode is refused at init rather than gated.
-- A **physical delayed connection** in a mode's trigger list is likewise 
-refused, since restoring one of its events after a history entry has no defined 
-meaning.
-- a schedule onto a **mode-local action of an inactive mode** is dropped 
-outright, where reactor-c admits the event, warns, and then never delivers it.

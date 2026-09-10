@@ -220,8 +220,7 @@ static const lf_mode_t* micromode_owning_mode(const Action* action) {
 }
 
 lf_ret_t lf_micromode_action_schedule(Action* self, interval_t offset, const void* value) {
-  validate(self->type == LOGICAL_ACTION);
-
+  // Physical and logical actions take the same path here, as they do in reactor-c. 
   const lf_mode_t* mode = micromode_owning_mode(self);
   validate(mode != NULL);
 
