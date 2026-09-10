@@ -259,9 +259,8 @@ lf_ret_t lf_micromode_validate_all(lf_micromode_program_t* program, Environment*
             // satisfy it.
             validate(micromode_saved_bound(mode->triggers[ti]) != SIZE_MAX);
           }
-          // A mode's actions must be logical and gated.
+          // A mode's actions must be gated.
           if (mode->triggers[ti]->type == TRIG_ACTION) {
-            validate(((Action*)mode->triggers[ti])->type == LOGICAL_ACTION);
             validate(((Action*)mode->triggers[ti])->schedule == lf_micromode_action_schedule);
           } else {
             validate(((DelayedConnection*)mode->triggers[ti])->type == LOGICAL_CONNECTION);

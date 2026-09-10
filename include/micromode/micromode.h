@@ -283,7 +283,8 @@ void lf_micromode_on_shutdown(void* state, Environment* environment);
  *  on a mode-local action.
  *
  *  Drops the schedule when the owning mode is not effectively active. Otherwise
- *  delegates to `Action_schedule` unchanged. Currently physical actions are rejected. */
+ *  delegates to `Action_schedule` unchanged. Applies to physical actions as well as
+ *  logical ones, which is what reactor-c does. */
 lf_ret_t lf_micromode_action_schedule(Action* self, interval_t offset, const void* value);
 
 /** @brief Install the mode gate on a mode-local action. Goes after `LF_INITIALIZE_ACTION`.
